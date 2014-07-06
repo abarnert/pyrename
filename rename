@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+import argparse
+from functools import partial
+import glob
+import os
+import re
+import shutil
+from subprocess import check_output
+import sys
+import unicodedata
+import urllib.parse
+
+__version__ = '0.0.1'
+
+def sed(name, cmd):
+    sout = check_ouput(['sed', '-e', values[0]], input=name,
+                       universal_newlines=True)
+    return sout.rstrip('\n')
+
+def pipe(name, cmd):
+    sout = check_output(shlex.split(cmd) + values, input=name,
+                        universal_newlines=True)
+    return sout.rstrip('\n')
+
+def echo(name, cmd):
+    sout = check_output(shlex.split(cmd) + values + [name])
+    return sout.rstrip('\n')
+
+def keepext(name):
+    # NOTE: This stack is exposed to --python expressions as a
+    # string ext and as a list exts, without leading dots (like $EXT
+    # and @EXT in the perl rename).
+    global extstack
+    name, ext = os.path.splitext(name)
+    if ext:
+        extstack.insert(0, ext)
+    return name
+
+# NOTE: We are intentionally allowing builtins here (hence no
+# '__builtins__': {}) and loaded modules; it's not a security risk so
+# long as anyone using -e isn't expecting it to be safer than running
+# an arbitrary Python script...
+def python(name, expr):
+    global userimports
+    ext = ''.join(extstack)[1:]
+    exts = [x[1:] for x in extstack]
+    n = format(counter, counterformat)
+    g = {'name': name, 'ext': ext, 'exts': exts, 'n': n}
+    g.update(userimports)
+    return eval(expr, g)
+        
+TRANSFORMS = {
+    'remove_extension': lambda s: os.path.splitext(s)[0],
+    'keep_extension': keepext,
+    'append': lambda s, suffix: s + suffix,
+    'prepend': lambda s, prefix: s + prefix,
+    'lower': str.lower,
+    'upper': str.upper,
+    'title': str.title,
+    're': lambda s, pattern, repl: re.sub(pattern, repl, s, 1),
+    're_all': lambda s, pattern, repl: re.sub(pattern, repl, s),
+    'subst': lambda s, old, new: s.replace(old, new, 1),
+    'subst_all': str.replace,
+    'python': python,
+    'sed': sed,
+    'pipe': pipe,
+    'echo': echo,
+    'urlesc': urllib.parse.unquote,
+    # str.isprintable excludes not just Control, but also Other and Separator
+    # characters other than space, which is probably a good Unicode match for
+    # the ASCII control class
+    'noctrl': lambda s: ''.join(c if c.isprintable() else '_' for c in s),
+    'nometa': lambda s: re.sub(r'[!"^()=?`*\':;<>|$]', '_', s),
+    'nows': lambda s: re.sub(r'\s+', '_', s),
+    'rews': lambda s: s.replace('_', ' '),
+    'trim': lambda s: re.sub(r'^(\s|_)+', '', re.sub(r'(\s|_)+$', '', s))
+    }
+
+# Appends all transforms to a single dest, marked with their fake dest,
+# so they can be run in order
+class Transform(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.transforms.append((TRANSFORMS[self.dest], values))
+        
+parser = argparse.ArgumentParser(description='Rename files.')
+parser.set_defaults(files=[])
+parser.set_defaults(transforms=[])
+
+igroup = parser.add_argument_group('input switches', '''
+By default, all of the files in FILES are transformed, in the order given.
+If there are no such files, each line of stdin names a file.''')
+
+# TODO: --transcode/-T (would require files to be bytes, not unicode)
+igroup.add_argument('--glob', '-g', action='store_true',
+                    help='expand "*" etc. in filenames, useful on Windows')
+igroup.add_argument('--null', '-0', action='store_true',
+                    help='separate filenames with null instead of newline')
+igroup.add_argument('--file', '-@', action='append', metavar='FILE',
+                    type=argparse.FileType('r'), dest='files', default=[],
+                    help='read (additional) filenames from FILE')
+igroup.add_argument('--stdin', action='store_true', default=None,
+                    help='read filenames from stdin even if FILES are given')
+igroup.add_argument('--backward', '--backwards',
+                    '--reverse-order', '--reverse', '-k',
+                    action='store_true',
+                    help='process filenames in reverse order')
+igroup.add_argument('--sort-time', '--sort-mtime', '-t', action='store_true',
+                    help='sort filenames in modification time order')
+igroup.add_argument('--sort-atime', action='store_true',
+                    help='sort filenames in access time order')
+igroup.add_argument('--sort-ctime', action='store_true',
+                    help='sort filenames in status change time order')
+igroup.add_argument('--sort-btime', '--sort-birthtime', action='store_true',
+                    help='sort filenames in creation time order')
+igroup.add_argument('--counter', '--counter-format', '-N',
+                    help='start and format the n counter variable')
+
+# As of 3.4, add_mutually_exclusive_group doesn't group the args, so
+# we'll do it manually. (We could build a container with a custom
+# conflict action, or hack _MutuallyExclusiveGroup, but that's more
+# work than it's worth.
+rgroup = parser.add_argument_group('rename switches (only one allowed)')
+
+rgroup.add_argument('--dry-run', '--just-print', '-n', action='store_true',
+                    help='do nothing, just print what would be renamed')
+rgroup.add_argument('--copy',  action='store_true',
+                    help='copy instead of moving')
+rgroup.add_argument('--rename',  action='store_true',
+                    help='use os.rename instead of moving')
+rgroup.add_argument('--replace',  action='store_true',
+                    help='use os.replace instead of moving')
+rgroup.add_argument('--hardlink', '-L', action='store_true',
+                    help='hardlink FILES instead of moving')
+rgroup.add_argument('--symlink', '-l', action='store_true',
+                    help='symlink FILES instead of moving')
+
+fgroup = parser.add_argument_group('rename flags')
+
+# TODO: --interactive/-i, --force/-f (or different flags that depend
+# on whether there's a target to overwrite, which may be different for
+# different rename switches)
+fgroup.add_argument('--mkdirs', '--mkpath', '--make-dirs', '-p', action='store_true',
+                    help='make any directories necessary')
+fgroup.add_argument('--verbose', '-v', action='store_true',
+                    help='print each rename before performing it')
+
+tgroup = parser.add_argument_group('transforms (applied sequentially)')
+
+tgroup.add_argument('--remove-extension', '--remove-ext', '-x',
+                    nargs=0, action=Transform,
+                    help='remove final extension from each filename, if any')
+tgroup.add_argument('--keep-extension', '--keep-ext', '-X',
+                    nargs=0, action=Transform,
+                    help='save and remove final extension from each filename, '
+                         'if any, appending after the rest of the operations')
+tgroup.add_argument('--append', '-a', nargs=1, action=Transform,
+                    metavar='SUFFIX',
+                    help='append SUFFIX to each filename')
+tgroup.add_argument('--prepend', '-A', nargs=1, action=Transform,
+                    metavar='PREFIX',
+                    help='prepend PREFIX to each filename')
+tgroup.add_argument('--lower', '--lower-case', '--lowercase', '-c',
+                    nargs=0, action=Transform,
+                    help='convert each filename to lowercase')
+tgroup.add_argument('--upper', '--upper-case', '--uppercase', '-C',
+                    nargs=0, action=Transform,
+                    help='convert each filename to uppercase')
+tgroup.add_argument('--title', '--title-case', '--titlecase',
+                    '--camel', '--camel-case', '--camelcase',
+                    nargs=0, action=Transform,
+                    help='convert each filename to title case')
+tgroup.add_argument('--regexp', '--regexp-one', '--re', '--re-one', '-r',
+                    nargs=2, dest='re', action=Transform,
+                    metavar=('PATTERN', 'REPL'),
+                    help='pass filenames through Python re.sub(count=1)')
+tgroup.add_argument('--regexp-all', '--re-all', '-R',
+                    nargs=2, dest='re-one', action=Transform,
+                    metavar=('PATTERN', 'REPL'),
+                    help='pass filenames through Python re.sub')
+tgroup.add_argument('--subst', '--subst-one', '-s', nargs=2, action=Transform,
+                    metavar=('OLD', 'NEW'),
+                    help='replace first instance of OLD with NEW')
+tgroup.add_argument('--subst-all', '-S', nargs=2, action=Transform,
+                    metavar=('OLD', 'NEW'),
+                    help='replace all instances of OLD with NEW')
+tgroup.add_argument('--python', '--eval', '-e', nargs=1, action=Transform,
+                    metavar=('PYEXPR'),
+                    help='pass filenames through Python expression, '
+                         'with the old name available as name')
+tgroup.add_argument('--sed', nargs=1, action=Transform,
+                    metavar=('SEDCOMMAND'),
+                    help='pass filenames through sed -e SEDCOMMAND')
+tgroup.add_argument('--pipe', '-P', nargs=1, action=Transform,
+                    metavar=('COMMAND'),
+                    help='pass filenames through a pipe to COMMAND')
+tgroup.add_argument('--echo', '-E', nargs=1, action=Transform,
+                    metavar=('COMMAND'),
+                    help='pass filenames through COMMAND with name as final arg')
+tgroup.add_argument('--urlesc', nargs=0, action=Transform,
+                    help='decode URL-escaped filenames')
+tgroup.add_argument('--noctrl', nargs=0, action=Transform,
+                    help='replace each control character with _')
+tgroup.add_argument('--nows', nargs=0, action=Transform,
+                    help='replace each whitespace sequence with a single _')
+tgroup.add_argument('--rews', nargs=0, action=Transform,
+                    help='replace each _ with a space')
+tgroup.add_argument('--trim', '--strip', nargs=0, action=Transform,
+                    help='remove leading and trailing whitespace and underscores')
+
+parser.add_argument('--import', '-M', dest='imports', action='append', default=[],
+                    help='import a Python module (for use with --python)')
+
+parser.add_argument('--version', '-V', action='version',
+                    version='%(prog)s {}'.format(__version__))
+
+parser.add_argument('files', nargs='*', action='append',
+                    help=('files to rename'))
+
+def transform(name):
+    global extstack
+    extstack = []
+    for transform in args.transforms:
+        func, values = transform
+        name = func(name, *values)
+    return name + ''.join(extstack)
+
+def rename(name):
+    newname = transform(name)
+
+    if args.verbose or args.dry_run:
+        print('{} -> {}'.format(name, newname))
+    if args.dry_run or newname == name:
+        return
+    
+    if args.mkdirs:
+        dir = os.path.dirname(newname)
+        if dir:
+            os.makedirs(os.path.dirname(newname), exist_ok=True)
+            
+    if args.hardlink:
+        return os.link(name, newname)
+    elif args.symlink:
+        return os.symlink(name, newname)
+    elif args.rename:
+        return os.rename(name, newname)
+    elif args.replace:
+        return os.replace(name, newname)
+    elif args.copy:
+        return shutil.copy2(name, newname)
+    else:
+        return shutil.move(name, newname)
+
+args = parser.parse_args()
+
+# Here's where we manually check rgroup exclusivity
+rdests = (action.dest for action in rgroup._group_actions)
+rflags = ((k, getattr(args, k)) for k in rdests)
+rsetflags = [k for k, v in rflags if v]
+if len(rsetflags) > 1:
+    msg = 'can only use one of {}'.format(', '.join(rsetflags))
+    parser.error(msg)
+
+# NOTE: We intentionally use __import__ here, not import_module, so
+# that importing a subpackage works as intended--all parents are
+# imported, and the top-level parent goes into the globals dict.
+userimports = {mod.__name__: mod for mod in
+               (__import__(mod) for mod in args.imports)}
+
+def readnull(f, bufsize=8192):
+    buf = ''
+    while True:
+        lines = buf.split('\0')
+        yield from lines[:-1]
+        buf = lines[-1]
+        newbuf = f.read(bufsize)
+        if not newbuf:
+            if buf:
+                yield buf
+            return
+        buf += newbuf
+
+def dofile(f):
+    if args.null:
+        f = readnull(f)
+    for line in f:
+        line = line.rstrip('\n')
+        if line:
+            rename(line)
+
+def dofile(file):
+    if args.null:
+        file = readnull(file)
+    for line in file:
+        line = line.rstrip('\n')
+        if line:
+            yield line
+                
+def dofiles():
+    for file in args.files:
+        if isinstance(file, str):
+            if args.glob:
+                yield from glob.glob(file)
+            else:
+                yield file
+        else:
+            yield from dofile(file)
+    if args.stdin or not args.files:
+        yield from dofile(sys.stdin)
+
+files = list(dofiles())
+if args.sort_time:
+    files.sort(key=os.path.getmtime)
+elif args.sort_atime:
+    files.sort(key=os.path.getatime)
+elif args.sort_ctime:
+    files.sort(key=os.path.getctime)
+elif args.sort_btime:
+    files.sort(key=lambda f: os.stat(f).st_birthtime)
+if args.backward:
+    files = files[::-1]
+
+counter = 1
+counterformat = ''
+if args.counter:
+    counterexpand = False
+    counterformat = args.counter.strip()
+    if counterformat.startswith('...'):
+        counterformat = counterformat[4:].strip()
+        counterexpand = True
+    if not counterformat:
+        counterformat='1'
+    counter = int(counterformat)
+    width = len(counterformat)
+    if counterexpand:
+        width = max(width, len(str(len(files))))
+    counterformat = '0{}'.format(width)
+
+for arg in files:
+    try:
+        rename(arg)
+        counter += 1
+    except Exception as e:
+        print('{}: {}'.format(arg, e))
